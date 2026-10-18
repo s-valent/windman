@@ -38,18 +38,14 @@ final class FocusController {
   private var stopCheck: Timer?
   private var pendingHover: PendingHover?
   private var transition: Task<Void, Never>?
-  private var hoveredWindow: UInt32?
   private var desktop: DesktopState?
-  private var mouseInteraction: MouseInteraction?
   private var lastStatus = ""
   private let startupError = wm_initialize().map { String(cString: $0) }
 
   func start() {
     guard !started else { return }
     started = true
-    events.onPointer = { [weak self] button, isFast in
-      self?.pointerChanged(button: button, isFast: isFast)
-    }
+    events.onPointer = { [weak self] event in self?.pointerChanged(event) }
     events.onDesktop = { [weak self] in self?.resetHover() }
     events.onActivation = { [weak self] in
       guard let self, !trusted else { return }
@@ -85,40 +81,47 @@ final class FocusController {
     }
   }
 
-  private func pointerChanged(button: Bool, isFast: Bool) {
-    pointerIsFast = isFast
-    evaluatePointer(button: button)
+  private func pointerChanged(_ event: PointerEvent) {
+    switch event {
+    case .button:
+      pointerIsFast = false
+      evaluatePointer(buttonChanged: true)
+    case .movement(let isFast):
+      pointerIsFast = isFast
+      evaluatePointer()
+    }
   }
 
-  private func evaluatePointer(button: Bool) {
+  private func evaluatePointer(buttonChanged: Bool = false) {
     guard started, enabled, trusted, startupError == nil else { return }
     guard let point = CGEvent(source: nil)?.location else { return }
     let id = wm_window_at_point(point)
-    let hovered: UInt32? = id
-    if !button && !suspended && hovered == hoveredWindow {
+    if !buttonChanged && !suspended && id == tracker.windowID {
       cancelStopCheck()
       return
     }
     let interaction = catalog.mouseInteraction()
-    let interacted =
-      button || interaction.isPressed || (mouseInteraction.map { $0 != interaction } ?? false)
-    mouseInteraction = interaction
-    if suspended || interacted {
+    let decision = tracker.update(
+      windowID: id, interaction: interaction, suspended: suspended, buttonChanged: buttonChanged,
+      isFast: pointerIsFast, transitionInProgress: transition != nil)
+    switch decision {
+    case .interrupted:
       cancelStopCheck()
       transition?.cancel()
       pendingMovement = false
-      hoveredWindow = hovered
-      _ = tracker.update(windowID: hovered, interaction: interaction, suspended: true)
       return
-    }
-    if pointerIsFast {
+    case .waitForStop:
       scheduleStopCheck(windowID: id, point: point, interaction: interaction)
       return
-    }
-    cancelStopCheck()
-    if transition != nil {
+    case .waitForTransition:
+      cancelStopCheck()
       pendingMovement = true
       return
+    case .unchanged:
+      cancelStopCheck()
+      return
+    case .focus:
+      cancelStopCheck()
     }
     guard AXIsProcessTrusted() else {
       refreshPermission()
@@ -126,7 +129,6 @@ final class FocusController {
     }
     let currentDesktop = catalog.desktopState()
     if currentDesktop != desktop {
-      desktop = currentDesktop
       resetHover()
       return
     }
@@ -135,67 +137,39 @@ final class FocusController {
       report("Waiting for the desktop to settle")
       return
     }
-    hoveredWindow = hovered
-    guard
-      let targetID = tracker.update(
-        windowID: hoveredWindow, interaction: interaction, suspended: suspended || interacted)
-    else {
-      if lastStatus.isEmpty || lastStatus == "Paused"
-        || lastStatus == "Accessibility permission required"
-        || lastStatus == "Waiting for the desktop to settle"
-      {
-        report("Following mouse")
-      }
-      return
-    }
+    startTransition(windowID: id, point: point, interaction: interaction)
+  }
 
-    do {
-      let operation: @MainActor () async throws -> String
-      if let finderDesktop = catalog.desktopWindow(at: point, hitWindowID: targetID) {
-        operation = { [catalog] in
-          try await catalog.focusDesktop(finderDesktop, expectedInteraction: interaction)
-          return "Following mouse · Desktop"
-        }
-      } else {
-        guard let plan = RaisePlan(targetID: targetID, frontToBack: catalog.visibleWindows())
-        else { return }
-        let elements = try catalog.resolve([plan.target])
-        guard let target = elements[targetID], catalog.isNormalWindow(target) else { return }
-        operation = { [catalog] in
-          try await catalog.apply(plan, elements: elements, expectedInteraction: interaction)
-          return "Following mouse · \(plan.protectedWindows.count) protected"
+  private func startTransition(windowID: UInt32, point: CGPoint, interaction: MouseInteraction) {
+    transition = Task { [weak self] in
+      guard let self else { return }
+      defer {
+        transition = nil
+        if pendingMovement {
+          pendingMovement = false
+          if stopCheck == nil { evaluatePointer() }
         }
       }
-      guard catalog.mouseInteraction() == interaction,
-        let currentPoint = CGEvent(source: nil)?.location,
-        wm_window_at_point(currentPoint) == targetID
-      else {
-        resetHover()
-        return
-      }
-      transition = Task { [weak self] in
-        guard let self else { return }
-        defer {
-          transition = nil
-          if pendingMovement {
-            pendingMovement = false
-            if stopCheck == nil { evaluatePointer(button: false) }
-          }
+      do {
+        try Task.checkCancellation()
+        guard let target = try catalog.target(at: point, windowID: windowID) else { return }
+        guard catalog.mouseInteraction() == interaction,
+          let currentPoint = CGEvent(source: nil)?.location,
+          wm_window_at_point(currentPoint) == windowID
+        else {
+          resetHover()
+          return
         }
-        do {
-          report(try await operation())
-        } catch is CancellationError {
-          report("Following mouse")
-        } catch WindowFailure.interactionChanged {
-          report("Following mouse")
-        } catch {
-          logger.error("\(error.localizedDescription, privacy: .public)")
-          report(error.localizedDescription)
-        }
+        try await catalog.apply(target, expectedInteraction: interaction)
+        report(target.status)
+      } catch is CancellationError {
+        report("Following mouse")
+      } catch WindowFailure.interactionChanged {
+        report("Following mouse")
+      } catch {
+        logger.error("\(error.localizedDescription, privacy: .public)")
+        report(error.localizedDescription)
       }
-    } catch {
-      logger.error("\(error.localizedDescription, privacy: .public)")
-      report(error.localizedDescription)
     }
   }
 
@@ -206,13 +180,10 @@ final class FocusController {
     transition?.cancel()
     pendingMovement = false
     desktop = catalog.desktopState()
-    tracker.reset()
     let interaction = catalog.mouseInteraction()
-    mouseInteraction = interaction
     let point = CGEvent(source: nil)?.location
     let id = point.map { wm_window_at_point($0) } ?? 0
-    hoveredWindow = id
-    _ = tracker.update(windowID: hoveredWindow, interaction: interaction, suspended: true)
+    tracker.reset(windowID: id, interaction: interaction)
   }
 
   private func scheduleStopCheck(windowID: UInt32, point: CGPoint, interaction: MouseInteraction) {
@@ -238,7 +209,7 @@ final class FocusController {
     else { return }
     pointerIsFast = false
     events.resetMotion()
-    evaluatePointer(button: false)
+    evaluatePointer()
   }
 
   private func cancelStopCheck() {

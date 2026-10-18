@@ -58,6 +58,11 @@ menu; the group is resolved before raising begins.
 - Workspace notifications reset tracking on Space, display, and session changes.
   Desktop and window snapshots are queried when entering a different window, rather
   than periodically while idle.
+- A pure hover tracker owns entry and click state, returning an explicit decision
+  to focus, wait for a stop, wait for restoration, or interrupt. The controller
+  handles event delivery, the one-shot stop check, and serialized execution.
+- Desktop and window targets share one execution path. Target planning reuses one
+  decoded window list; transition verification always reads current state.
 - Pointer movement during a transition is coalesced to the latest position. The
   current transition finishes restoring protected windows before the next hover
   is processed, so fast movement cannot abandon a partially reordered stack.

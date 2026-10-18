@@ -19,10 +19,12 @@ enum WindmanApp {
       print("Private APIs: \(error ?? "available")")
       print("Accessibility (this process): \(AXIsProcessTrusted() ? "granted" : "not granted")")
       print("The menu-bar app's permission may differ; check its status menu.")
-      let desktop = WindowCatalog().desktopState()
+      let catalog = WindowCatalog()
+      let desktop = catalog.desktopState()
       print("Active Spaces: \(desktop.spaceIDs.sorted()); animating: \(desktop.isAnimating)")
-      print("Visible normal-layer windows: \(WindowCatalog().visibleWindows().count)")
-      WindowCatalog().visibleWindows().forEach { window in
+      let windows = catalog.visibleWindows()
+      print("Visible normal-layer windows: \(windows.count)")
+      windows.forEach { window in
         let name = NSRunningApplication(processIdentifier: window.processID)?.localizedName ?? "?"
         print("\(window.id) \(name) \(window.bounds)")
       }
@@ -46,7 +48,7 @@ enum WindmanApp {
         }
         print("Target: \(windowID); protected: \(plan.protectedWindows.map(\.id))")
         let started = ContinuousClock.now
-        try await catalog.apply(plan, elements: catalog.resolve([plan.target]))
+        try await catalog.apply(plan, element: catalog.resolve(plan.target))
         print("Verified stacking order and keyboard focus in \(started.duration(to: .now))")
         exit(0)
       } catch {

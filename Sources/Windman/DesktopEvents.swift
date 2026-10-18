@@ -1,9 +1,14 @@
 import AppKit
 import WindowRules
 
+enum PointerEvent {
+  case button
+  case movement(isFast: Bool)
+}
+
 @MainActor
 final class DesktopEvents: NSObject {
-  var onPointer: ((Bool, Bool) -> Void)?
+  var onPointer: ((PointerEvent) -> Void)?
   var onDesktop: (() -> Void)?
   var onActivation: (() -> Void)?
 
@@ -78,7 +83,7 @@ final class DesktopEvents: NSObject {
     case .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
       .otherMouseDown, .otherMouseUp:
       resetMotion()
-      onPointer?(true, false)
+      onPointer?(.button)
     default:
       if let point = event.cgEvent?.location {
         motion.update(position: point, timestamp: event.timestamp)
@@ -89,7 +94,7 @@ final class DesktopEvents: NSObject {
         guard let self else { return }
         movementQueued = false
         guard running else { return }
-        onPointer?(false, motion.isFast)
+        onPointer?(.movement(isFast: motion.isFast))
       }
     }
   }

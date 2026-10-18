@@ -27,6 +27,18 @@ enum WindowFailure: LocalizedError {
   }
 }
 
+enum FocusTarget {
+  case window(RaisePlan, AXUIElement)
+  case desktop(processID: Int32, windowID: UInt32?)
+
+  var status: String {
+    switch self {
+    case .window(let plan, _): "Following mouse · \(plan.protectedWindows.count) protected"
+    case .desktop: "Following mouse · Desktop"
+    }
+  }
+}
+
 @MainActor
 struct WindowCatalog {
   func mouseInteraction() -> MouseInteraction {
@@ -46,130 +58,55 @@ struct WindowCatalog {
   }
 
   func visibleWindows() -> [WindowSnapshot] {
-    let desktop = desktopState()
-    guard desktop.isStable else { return [] }
-    let displays = displayBounds()
-    guard
-      let entries = CGWindowListCopyWindowInfo(
-        [.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID
-      ) as? [NSDictionary]
-    else { return [] }
-
-    return entries.compactMap { entry in
-      guard let id = entry[kCGWindowNumber] as? NSNumber,
-        let process = entry[kCGWindowOwnerPID] as? NSNumber,
-        let layer = entry[kCGWindowLayer] as? NSNumber,
-        let alpha = entry[kCGWindowAlpha] as? NSNumber,
-        let bounds = entry[kCGWindowBounds] as? NSDictionary,
-        let rectangle = CGRect(dictionaryRepresentation: bounds),
-        layer.intValue == 0, alpha.doubleValue > 0, !rectangle.isEmpty,
-        process.int32Value != ProcessInfo.processInfo.processIdentifier,
-        displays.contains(where: { $0.intersects(rectangle) }),
-        let spaces = wm_copy_window_spaces(id.uint32Value) as? [NSNumber],
-        desktop.includes(windowSpaces: Set(spaces.map(\.uint64Value)))
-      else { return nil }
-
-      return WindowSnapshot(
-        id: id.uint32Value, processID: process.int32Value, bounds: rectangle)
-    }
+    visibleWindows(in: windowEntries())
   }
 
-  func resolve(_ windows: [WindowSnapshot]) throws -> [UInt32: AXUIElement] {
-    let groups = Dictionary(grouping: windows, by: \.processID)
-    return try groups.reduce(into: [:]) { result, group in
-      let application = AXUIElementCreateApplication(group.key)
-      try check(
-        AXUIElementSetMessagingTimeout(application, 0.25), action: "Set messaging timeout")
-      var value: CFTypeRef?
-      try check(
-        AXUIElementCopyAttributeValue(application, kAXWindowsAttribute as CFString, &value),
-        action: "Read application windows")
-      guard let elements = value as? [AXUIElement] else {
-        throw WindowFailure.unavailable(group.value[0].id)
-      }
-      let wanted = Set(group.value.map(\.id))
-      elements.forEach { element in
-        let id = wm_accessibility_window_id(element)
-        guard wanted.contains(id) else { return }
-        result[id] = element
-      }
-      if let missing = group.value.first(where: { result[$0.id] == nil }) {
-        throw WindowFailure.unavailable(missing.id)
-      }
-    }
-  }
-
-  func desktopWindow(at point: CGPoint, hitWindowID: UInt32) -> WindowSnapshot? {
-    guard
-      let finder = NSRunningApplication.runningApplications(
-        withBundleIdentifier: "com.apple.finder"
-      ).first,
-      let entries = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID)
-        as? [NSDictionary]
-    else { return nil }
-    let underPointer = entries.filter { entry in
-      guard let bounds = entry[kCGWindowBounds] as? NSDictionary,
-        let rectangle = CGRect(dictionaryRepresentation: bounds),
-        let alpha = entry[kCGWindowAlpha] as? NSNumber
-      else { return false }
-      return alpha.doubleValue > 0 && rectangle.contains(point)
-    }
-    let hit =
-      hitWindowID == 0
-      ? underPointer.first
-      : underPointer.first {
-        ($0[kCGWindowNumber] as? NSNumber)?.uint32Value == hitWindowID
-      }
-    let desktopLevel = CGWindowLevelForKey(.desktopIconWindow)
-    guard let level = hit?[kCGWindowLayer] as? NSNumber,
-      level.int32Value <= desktopLevel
-    else { return nil }
-    let desktop = underPointer.first {
-      ($0[kCGWindowOwnerPID] as? NSNumber)?.int32Value == finder.processIdentifier
-        && ($0[kCGWindowLayer] as? NSNumber)?.int32Value == desktopLevel
-    }
-    return WindowSnapshot(
-      id: (desktop?[kCGWindowNumber] as? NSNumber)?.uint32Value ?? 0,
-      processID: finder.processIdentifier, bounds: .zero)
-  }
-
-  func focusDesktop(
-    _ window: WindowSnapshot, expectedInteraction: MouseInteraction
-  ) async throws {
-    let desktop = desktopState()
-    guard desktop.isStable else { throw WindowFailure.desktopChanged }
-    guard !expectedInteraction.isPressed else { throw WindowFailure.interactionChanged }
-    try requireContext(desktop, interaction: expectedInteraction)
-    let previous = focusedWindowID()
-    if NSWorkspace.shared.frontmostApplication?.processIdentifier == window.processID,
-      window.id == 0 || previous == window.id
-    {
-      return
-    }
-    let changes = WindowChanges()
-    changes.start(processIDs: [window.processID], elements: [])
-    defer { changes.stop() }
-    try requireContext(desktop, interaction: expectedInteraction)
-    let result =
-      window.id == 0
-      ? wm_focus_process(window.processID) : wm_focus_window(window.id, previous)
-    guard result == 0 else { throw WindowFailure.focus(result) }
-    let focused = try await changes.wait(for: .milliseconds(300)) {
-      try requireContext(desktop, interaction: expectedInteraction)
-      return NSWorkspace.shared.frontmostApplication?.processIdentifier == window.processID
-    }
-    guard focused else { throw WindowFailure.focusNotApplied(window.id) }
-    trace("Focused desktop")
-  }
-
-  func isNormalWindow(_ element: AXUIElement) -> Bool {
+  func resolve(_ window: WindowSnapshot) throws -> AXUIElement {
+    let application = AXUIElementCreateApplication(window.processID)
+    try check(AXUIElementSetMessagingTimeout(application, 0.25), action: "Set messaging timeout")
     var value: CFTypeRef?
-    guard
-      AXUIElementCopyAttributeValue(
-        element, kAXSubroleAttribute as CFString, &value) == .success
-    else { return false }
-    let subrole = value as? String
-    return subrole == kAXStandardWindowSubrole || subrole == kAXDialogSubrole
+    try check(
+      AXUIElementCopyAttributeValue(application, kAXWindowsAttribute as CFString, &value),
+      action: "Read application windows")
+    guard let elements = value as? [AXUIElement],
+      let element = elements.first(where: { wm_accessibility_window_id($0) == window.id })
+    else { throw WindowFailure.unavailable(window.id) }
+    return element
+  }
+
+  func target(at point: CGPoint, windowID: UInt32) throws -> FocusTarget? {
+    let entries = windowEntries()
+    let underPointer = entries.filter { $0.window.bounds.contains(point) }
+    let hit =
+      windowID == 0 ? underPointer.first : underPointer.first { $0.window.id == windowID }
+    let desktopLevel = CGWindowLevelForKey(.desktopIconWindow)
+    if let hit, hit.level <= desktopLevel {
+      guard
+        let finder = NSRunningApplication.runningApplications(
+          withBundleIdentifier: "com.apple.finder"
+        ).first
+      else { return nil }
+      let desktop = underPointer.first {
+        $0.window.processID == finder.processIdentifier && $0.level == desktopLevel
+      }
+      return .desktop(processID: finder.processIdentifier, windowID: desktop?.window.id)
+    }
+    guard let plan = RaisePlan(targetID: windowID, frontToBack: visibleWindows(in: entries))
+    else { return nil }
+    let element = try resolve(plan.target)
+    guard isNormalWindow(element) else { return nil }
+    return .window(plan, element)
+  }
+
+  func apply(_ target: FocusTarget, expectedInteraction: MouseInteraction) async throws {
+    switch target {
+    case .window(let plan, let element):
+      try await apply(
+        plan, element: element, expectedInteraction: expectedInteraction)
+    case .desktop(let processID, let windowID):
+      try await focusDesktop(
+        processID: processID, windowID: windowID, interaction: expectedInteraction)
+    }
   }
 
   func focusedWindowID() -> UInt32 {
@@ -189,25 +126,21 @@ struct WindowCatalog {
   }
 
   func apply(
-    _ plan: RaisePlan, elements: [UInt32: AXUIElement],
+    _ plan: RaisePlan, element: AXUIElement,
     expectedInteraction: MouseInteraction? = nil
   ) async throws {
-    let desktop = desktopState()
-    let interaction = expectedInteraction ?? mouseInteraction()
-    guard desktop.isStable else { throw WindowFailure.desktopChanged }
-    guard !interaction.isPressed else { throw WindowFailure.interactionChanged }
-    let changes = WindowChanges()
-    changes.start(
-      processIDs: Set(plan.backToFront.map(\.processID)), elements: Array(elements.values))
-    defer { changes.stop() }
-    var resolved = elements
+    let context = try TransitionContext(interaction: expectedInteraction)
+    context.changes.start(
+      processIDs: Set(plan.backToFront.map(\.processID)), elements: [element])
+    defer { context.changes.stop() }
+    var resolved = [plan.target.id: element]
     try await WindowTransition.perform(
       plan,
       currentOrder: { visibleWindows().map(\.id) },
       prepare: { window in
-        try requireContext(desktop, interaction: interaction)
+        try context.validate()
         if resolved[window.id] == nil {
-          resolved.merge(try resolve([window])) { _, fresh in fresh }
+          resolved[window.id] = try resolve(window)
         }
         guard let element = resolved[window.id] else {
           throw WindowFailure.unavailable(window.id)
@@ -215,25 +148,80 @@ struct WindowCatalog {
         try prepare(window, element: element)
       },
       raise: { window in
-        try requireContext(desktop, interaction: interaction)
+        try context.validate()
         guard let element = resolved[window.id] else {
           throw WindowFailure.unavailable(window.id)
         }
         try await raise(
-          window, element: element, desktop: desktop, interaction: interaction, changes: changes,
+          window, element: element, context: context,
           focusTarget: window.id == plan.target.id)
       },
       focus: { window in
-        try await focus(window, desktop: desktop, interaction: interaction, changes: changes)
+        try await focus(window, context: context)
       }
     )
-    try requireContext(desktop, interaction: interaction)
+    try context.validate()
     let expected = plan.protectedWindows.map(\.id) + [plan.target.id]
     let actual = visibleWindows().prefix(expected.count).map(\.id)
     guard actual == expected else { throw WindowFailure.orderNotApplied(plan.target.id) }
     guard focusedWindowID() == plan.target.id else {
       throw WindowFailure.focusNotApplied(plan.target.id)
     }
+  }
+
+  private func windowEntries() -> [WindowEntry] {
+    let entries =
+      CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID)
+      as? [NSDictionary] ?? []
+    return entries.compactMap(WindowEntry.init)
+  }
+
+  private func visibleWindows(in entries: [WindowEntry]) -> [WindowSnapshot] {
+    let desktop = desktopState()
+    guard desktop.isStable else { return [] }
+    let displays = displayBounds()
+    return entries.compactMap { entry in
+      let window = entry.window
+      guard entry.level == 0,
+        window.processID != ProcessInfo.processInfo.processIdentifier,
+        displays.contains(where: { $0.intersects(window.bounds) }),
+        let spaces = wm_copy_window_spaces(window.id) as? [NSNumber],
+        desktop.includes(windowSpaces: Set(spaces.map(\.uint64Value)))
+      else { return nil }
+      return window
+    }
+  }
+
+  private func isNormalWindow(_ element: AXUIElement) -> Bool {
+    var value: CFTypeRef?
+    guard
+      AXUIElementCopyAttributeValue(
+        element, kAXSubroleAttribute as CFString, &value) == .success
+    else { return false }
+    let subrole = value as? String
+    return subrole == kAXStandardWindowSubrole || subrole == kAXDialogSubrole
+  }
+
+  private func focusDesktop(
+    processID: Int32, windowID: UInt32?, interaction: MouseInteraction
+  ) async throws {
+    let context = try TransitionContext(interaction: interaction)
+    let previous = focusedWindowID()
+    if NSWorkspace.shared.frontmostApplication?.processIdentifier == processID,
+      windowID == nil || previous == windowID
+    {
+      return
+    }
+    context.changes.start(processIDs: [processID], elements: [])
+    defer { context.changes.stop() }
+    try context.validate()
+    let result = windowID.map { wm_focus_window($0, previous) } ?? wm_focus_process(processID)
+    guard result == 0 else { throw WindowFailure.focus(result) }
+    let focused = try await context.wait(for: .milliseconds(300)) {
+      NSWorkspace.shared.frontmostApplication?.processIdentifier == processID
+    }
+    guard focused else { throw WindowFailure.focusNotApplied(windowID ?? 0) }
+    trace("Focused desktop")
   }
 
   private func prepare(_ window: WindowSnapshot, element: AXUIElement) throws {
@@ -248,27 +236,22 @@ struct WindowCatalog {
   }
 
   private func raise(
-    _ window: WindowSnapshot, element: AXUIElement, desktop: DesktopState,
-    interaction: MouseInteraction, changes: WindowChanges, focusTarget: Bool
+    _ window: WindowSnapshot, element: AXUIElement, context: TransitionContext, focusTarget: Bool
   ) async throws {
-    try requireContext(desktop, interaction: interaction)
+    try context.validate()
     guard visibleWindows().first?.id != window.id else { return }
-    try requireContext(desktop, interaction: interaction)
+    try context.validate()
     var result = AXUIElementPerformAction(element, kAXRaiseAction as CFString)
     trace("AXRaise \(window.id): \(result.rawValue)")
     if result == .success {
-      if focusTarget {
-        try requestFocus(window, desktop: desktop, interaction: interaction)
-      } else if try await waitForFront(
-        window.id, desktop: desktop, interaction: interaction, changes: changes,
-        timeout: .milliseconds(40))
+      if !focusTarget,
+        try await waitForFront(
+          window.id, context: context, timeout: .milliseconds(40))
       {
         return
       }
-      if !focusTarget {
-        try requestFocus(window, desktop: desktop, interaction: interaction)
-      }
-      try requireContext(desktop, interaction: interaction)
+      try requestFocus(window, context: context)
+      try context.validate()
       result = AXUIElementPerformAction(element, kAXRaiseAction as CFString)
     }
     if result != .success {
@@ -281,31 +264,24 @@ struct WindowCatalog {
       try check(
         AXUIElementSetAttributeValue(element, kAXMainAttribute as CFString, kCFBooleanTrue),
         action: "Select main window \(window.id)")
-      try requireContext(desktop, interaction: interaction)
+      try context.validate()
       guard let application = NSRunningApplication(processIdentifier: window.processID),
         application.activate(options: [])
       else { throw WindowFailure.unavailable(window.id) }
     }
     guard
       try await waitForFront(
-        window.id, desktop: desktop, interaction: interaction, changes: changes,
-        timeout: .milliseconds(400))
+        window.id, context: context, timeout: .milliseconds(400))
     else {
       throw WindowFailure.orderNotApplied(window.id)
     }
     trace("Raised \(window.id)")
   }
 
-  private func focus(
-    _ window: WindowSnapshot, desktop: DesktopState, interaction: MouseInteraction,
-    changes: WindowChanges
-  ) async throws {
-    try requireContext(desktop, interaction: interaction)
-    guard focusedWindowID() != window.id else { return }
-    try requestFocus(window, desktop: desktop, interaction: interaction)
-    let focused = try await changes.wait(for: .milliseconds(300)) {
-      try requireContext(desktop, interaction: interaction)
-      return focusedWindowID() == window.id
+  private func focus(_ window: WindowSnapshot, context: TransitionContext) async throws {
+    guard try requestFocus(window, context: context) else { return }
+    let focused = try await context.wait(for: .milliseconds(300)) {
+      focusedWindowID() == window.id
     }
     guard focused else {
       throw WindowFailure.focusNotApplied(window.id)
@@ -313,32 +289,24 @@ struct WindowCatalog {
     trace("Focused \(window.id)")
   }
 
-  private func requestFocus(
-    _ window: WindowSnapshot, desktop: DesktopState, interaction: MouseInteraction
-  ) throws {
-    try requireContext(desktop, interaction: interaction)
+  @discardableResult
+  private func requestFocus(_ window: WindowSnapshot, context: TransitionContext) throws -> Bool {
+    try context.validate()
     let previous = focusedWindowID()
-    guard previous != window.id else { return }
-    try requireContext(desktop, interaction: interaction)
+    guard previous != window.id else { return false }
+    try context.validate()
     let result = wm_focus_window(window.id, previous)
     guard result == 0 else { throw WindowFailure.focus(result) }
     trace("Requested focus \(window.id)")
+    return true
   }
 
   private func waitForFront(
-    _ windowID: UInt32, desktop: DesktopState, interaction: MouseInteraction,
-    changes: WindowChanges, timeout: Duration
+    _ windowID: UInt32, context: TransitionContext, timeout: Duration
   ) async throws -> Bool {
-    try await changes.wait(for: timeout) {
-      try requireContext(desktop, interaction: interaction)
-      return visibleWindows().first?.id == windowID
+    try await context.wait(for: timeout) {
+      visibleWindows().first?.id == windowID
     }
-  }
-
-  private func requireContext(_ expected: DesktopState, interaction: MouseInteraction) throws {
-    try Task.checkCancellation()
-    guard desktopState() == expected else { throw WindowFailure.desktopChanged }
-    guard mouseInteraction() == interaction else { throw WindowFailure.interactionChanged }
   }
 
   private func displayBounds() -> [CGRect] {
@@ -357,6 +325,53 @@ struct WindowCatalog {
   private func check(_ error: AXError, action: String) throws {
     guard error == .success else {
       throw WindowFailure.accessibility(action, error.rawValue)
+    }
+  }
+}
+
+private struct WindowEntry {
+  let window: WindowSnapshot
+  let level: Int32
+
+  init?(_ entry: NSDictionary) {
+    guard let id = entry[kCGWindowNumber] as? NSNumber,
+      let process = entry[kCGWindowOwnerPID] as? NSNumber,
+      let layer = entry[kCGWindowLayer] as? NSNumber,
+      let alpha = entry[kCGWindowAlpha] as? NSNumber, alpha.doubleValue > 0,
+      let bounds = entry[kCGWindowBounds] as? NSDictionary,
+      let rectangle = CGRect(dictionaryRepresentation: bounds), !rectangle.isEmpty
+    else { return nil }
+    window = WindowSnapshot(id: id.uint32Value, processID: process.int32Value, bounds: rectangle)
+    level = layer.int32Value
+  }
+}
+
+@MainActor
+private struct TransitionContext {
+  let changes = WindowChanges()
+  private let desktop: DesktopState
+  private let interaction: MouseInteraction
+
+  init(interaction: MouseInteraction?) throws {
+    let catalog = WindowCatalog()
+    desktop = catalog.desktopState()
+    self.interaction = interaction ?? catalog.mouseInteraction()
+    guard desktop.isStable else { throw WindowFailure.desktopChanged }
+    guard !self.interaction.isPressed else { throw WindowFailure.interactionChanged }
+    try validate()
+  }
+
+  func validate() throws {
+    try Task.checkCancellation()
+    let catalog = WindowCatalog()
+    guard catalog.desktopState() == desktop else { throw WindowFailure.desktopChanged }
+    guard catalog.mouseInteraction() == interaction else { throw WindowFailure.interactionChanged }
+  }
+
+  func wait(for duration: Duration, until predicate: @escaping () -> Bool) async throws -> Bool {
+    try await changes.wait(for: duration) {
+      try validate()
+      return predicate()
     }
   }
 }
