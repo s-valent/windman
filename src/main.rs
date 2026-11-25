@@ -852,7 +852,13 @@ impl Render for Windman {
                     .border_b_1()
                     .border_color(rgba((theme.muted << 8) | 0x35))
                     .child(search_icon(theme.foreground))
-                    .child(div().flex_1().h(px(24.)).child(self.input.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h(px(24.))
+                            .child(self.input.clone()),
+                    )
                     .on_any_mouse_down(cx.listener(|view, _, window, context| {
                         view.set_terminal_focus(false, window, context);
                     })),

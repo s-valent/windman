@@ -36,6 +36,7 @@ open dist/Windman.app
 - Recent apps and commands are persisted and ranked first while searching.
 - Cursor blinks white; selection/search/active accents are white/gray.
 - Editing supports Cmd/Alt+Left/Right, Shift variants, Home/End, Cmd/Alt+Backspace/Delete, and Shift+Home/End.
+- Long input scrolls horizontally to keep the caret visible while typing, selecting, or navigating.
 - Tab `×` kills a command. Cmd+Q is disabled so it cannot quit the app or interrupt running commands.
 
 Prototype limits: no text selection. Terminal columns/rows follow the window size and font.

@@ -1,8 +1,8 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, LayoutId,
+    App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
     fill, hsla, point, prelude::*, px, relative, rgb, rgba, size,
@@ -60,6 +60,7 @@ pub struct TextInput {
     marked_range: Option<Range<usize>>,
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
+    scroll_x: Pixels,
     is_selecting: bool,
     cursor_visible: bool,
     cursor_active: bool,
@@ -90,6 +91,7 @@ impl TextInput {
             marked_range: None,
             last_layout: None,
             last_bounds: None,
+            scroll_x: px(0.),
             is_selecting: false,
             cursor_visible: true,
             cursor_active: false,
@@ -355,7 +357,7 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left())
+        line.closest_index_for_x(position.x - bounds.left() + self.scroll_x)
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -530,11 +532,11 @@ impl EntityInputHandler for TextInput {
         let range = self.range_from_utf16(&range_utf16);
         Some(Bounds::from_corners(
             point(
-                bounds.left() + last_layout.x_for_index(range.start),
+                bounds.left() + last_layout.x_for_index(range.start) - self.scroll_x,
                 bounds.top(),
             ),
             point(
-                bounds.left() + last_layout.x_for_index(range.end),
+                bounds.left() + last_layout.x_for_index(range.end) - self.scroll_x,
                 bounds.bottom(),
             ),
         ))
@@ -547,10 +549,12 @@ impl EntityInputHandler for TextInput {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         let line_point = self.last_bounds?.localize(&point)?;
+        if self.content.is_empty() {
+            return Some(0);
+        }
         let last_layout = self.last_layout.as_ref()?;
 
-        assert_eq!(last_layout.text, self.content);
-        let utf8_index = last_layout.index_for_x(point.x - line_point.x)?;
+        let utf8_index = last_layout.closest_index_for_x(line_point.x + self.scroll_x);
         Some(self.offset_to_utf16(utf8_index))
     }
 }
@@ -563,6 +567,7 @@ struct PrepaintState {
     line: Option<ShapedLine>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
+    scroll_x: Pixels,
 }
 
 impl IntoElement for TextElement {
@@ -660,12 +665,23 @@ impl Element for TextElement {
             .shape_line(display_text, font_size, &runs, None);
 
         let cursor_pos = line.x_for_index(cursor);
+        let scroll_x = input_scroll_offset(
+            input.scroll_x,
+            cursor_pos,
+            if input.content.is_empty() {
+                px(0.)
+            } else {
+                line.width
+            },
+            bounds.size.width,
+        );
+        let text_left = bounds.left() - scroll_x;
         let (selection, cursor) = if selected_range.is_empty() && input.cursor_visible {
             (
                 None,
                 Some(fill(
                     Bounds::new(
-                        point(bounds.left() + cursor_pos, bounds.top()),
+                        point(text_left + cursor_pos, bounds.top()),
                         size(px(2.), bounds.bottom() - bounds.top()),
                     ),
                     rgb(0xffffff),
@@ -676,11 +692,11 @@ impl Element for TextElement {
                 Some(fill(
                     Bounds::from_corners(
                         point(
-                            bounds.left() + line.x_for_index(selected_range.start),
+                            text_left + line.x_for_index(selected_range.start),
                             bounds.top(),
                         ),
                         point(
-                            bounds.left() + line.x_for_index(selected_range.end),
+                            text_left + line.x_for_index(selected_range.end),
                             bounds.bottom(),
                         ),
                     ),
@@ -697,6 +713,7 @@ impl Element for TextElement {
             line: Some(line),
             cursor,
             selection,
+            scroll_x,
         }
     }
 
@@ -716,23 +733,31 @@ impl Element for TextElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        if let Some(selection) = prepaint.selection.take() {
-            window.paint_quad(selection)
-        }
         let line = prepaint.line.take().unwrap();
-        line.paint(bounds.origin, window.line_height(), window, cx)
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            if let Some(selection) = prepaint.selection.take() {
+                window.paint_quad(selection)
+            }
+            line.paint(
+                point(bounds.left() - prepaint.scroll_x, bounds.top()),
+                window.line_height(),
+                window,
+                cx,
+            )
             .unwrap();
 
-        if window.is_window_active()
-            && focus_handle.is_focused(window)
-            && let Some(cursor) = prepaint.cursor.take()
-        {
-            window.paint_quad(cursor);
-        }
+            if window.is_window_active()
+                && focus_handle.is_focused(window)
+                && let Some(cursor) = prepaint.cursor.take()
+            {
+                window.paint_quad(cursor);
+            }
+        });
 
         self.input.update(cx, |input, _cx| {
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
+            input.scroll_x = prepaint.scroll_x;
         });
     }
 }
@@ -746,6 +771,8 @@ impl Render for TextInput {
         }
         div()
             .flex()
+            .w_full()
+            .min_w_0()
             .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
@@ -832,4 +859,58 @@ impl TextInput {
 
 fn word_character(character: char) -> bool {
     character.is_alphanumeric() || character == '_'
+}
+
+fn input_scroll_offset(
+    previous: Pixels,
+    cursor: Pixels,
+    text_width: Pixels,
+    viewport_width: Pixels,
+) -> Pixels {
+    let visible_width = (viewport_width - px(2.)).max(px(0.));
+    let max_scroll = (text_width - visible_width).max(px(0.));
+    previous
+        .min(cursor)
+        .max(cursor - visible_width)
+        .clamp(px(0.), max_scroll)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::input_scroll_offset;
+    use gpui::px;
+
+    #[test]
+    fn long_input_keeps_the_caret_visible_in_both_directions() {
+        let end = input_scroll_offset(px(0.), px(600.), px(600.), px(200.));
+        assert_eq!(end, px(402.));
+        let middle = input_scroll_offset(end, px(450.), px(600.), px(200.));
+        assert_eq!(middle, end);
+        let left = input_scroll_offset(middle, px(300.), px(600.), px(200.));
+        assert_eq!(left, px(300.));
+        assert_eq!(
+            input_scroll_offset(left, px(0.), px(600.), px(200.)),
+            px(0.)
+        );
+    }
+
+    #[test]
+    fn shortening_input_and_resizing_clamp_the_scroll_offset() {
+        assert_eq!(
+            input_scroll_offset(px(402.), px(50.), px(50.), px(200.)),
+            px(0.)
+        );
+        assert_eq!(
+            input_scroll_offset(px(402.), px(600.), px(600.), px(800.)),
+            px(0.)
+        );
+        assert_eq!(
+            input_scroll_offset(px(0.), px(600.), px(600.), px(100.)),
+            px(502.)
+        );
+        assert_eq!(
+            input_scroll_offset(px(402.), px(0.), px(0.), px(200.)),
+            px(0.)
+        );
+    }
 }
